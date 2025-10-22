@@ -11,248 +11,259 @@ import RPi.GPIO as GPIO
 
 # Constants
 I2C_ADDR = 0x52  # Default I2C address
-I2C_BUS = 1      # Jetson I2C bus 1 (pins 3, 5)
+I2C_BUS = 7      # I2C bus 7 (from your successful detection)
 
 # GPIO Pins for Jetson Orin Nano - USING BOARD NUMBERING
-# Based on your pinout:
-# Pin 3 = I2C1_SDA (I2C Bus 7)
-# Pin 5 = I2C1_SCL (I2C Bus 7)
-# Pin 7 = GPIO09 (GPIO492) - Using for WAKE_UP
-# Pin 11 = UART1_RTS (GPIO460) - Using for INT
 WAKE_UP_PIN = 7   # Physical pin 7 (GPIO09/GPIO492)
 INT_PIN = 11      # Physical pin 11 (UART1_RTS/GPIO460)
 
-# Measurement Interval
-MEASUREMENT_INTERVAL = 0.1  # seconds
-POLL_INTERVAL = 0.01        # seconds
+# Register Addresses
+REGISTER_MAP = {
+    0x0000: 'Version',
+    0x0001: 'Protocol Status',
+    0x0002: 'Measure Counter', 
+    0x0003: 'Detector Status',
+    0x0010: 'Distance Result',
+    0x0011: 'Peak0 Distance',
+    0x001B: 'Peak0 Strength',
+}
+
+# Command Values
+COMMAND_APPLY_CONFIG_AND_CALIBRATE = 1
+COMMAND_MEASURE_DISTANCE = 2
 
 # Initialize I2C
 bus = smbus2.SMBus(I2C_BUS)
 
-# Initialize GPIO - USING BOARD NUMBERING
+# Initialize GPIO
 GPIO.setmode(GPIO.BOARD)
 GPIO.setup(WAKE_UP_PIN, GPIO.OUT)
 GPIO.setup(INT_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
 
-# Set initial state
-GPIO.output(WAKE_UP_PIN, GPIO.LOW)
-print(f"Initialized WAKE_UP_PIN (Pin {WAKE_UP_PIN}) to LOW")
-print(f"INT_PIN on Pin {INT_PIN}")
-
 def read_unsigned_register(reg_addr):
-    """
-    Reads a 32-bit unsigned register from the XM125 module.
-    """
+    """Reads a 32-bit unsigned register from the XM125 module."""
     try:
-        # Convert register address to bytes
         addr_high = (reg_addr >> 8) & 0xFF
         addr_low = reg_addr & 0xFF
         
-        # Write register address
         bus.write_byte_data(I2C_ADDR, addr_high, addr_low)
         time.sleep(0.01)
         
-        # Read 4 bytes
         data = bus.read_i2c_block_data(I2C_ADDR, 0x00, 4)
         value = struct.unpack('>I', bytes(data))[0]
         return value
     except Exception as e:
-        print(f"Read unsigned register error: {e}")
+        print(f"Read register 0x{reg_addr:04X} error: {e}")
         return None
 
 def read_signed_register(reg_addr):
-    """
-    Reads a 32-bit signed register from the XM125 module.
-    """
+    """Reads a 32-bit signed register from the XM125 module."""
     try:
-        # Convert register address to bytes
         addr_high = (reg_addr >> 8) & 0xFF
         addr_low = reg_addr & 0xFF
         
-        # Write register address
         bus.write_byte_data(I2C_ADDR, addr_high, addr_low)
         time.sleep(0.01)
         
-        # Read 4 bytes
         data = bus.read_i2c_block_data(I2C_ADDR, 0x00, 4)
         value = struct.unpack('>i', bytes(data))[0]
         return value
     except Exception as e:
-        print(f"Read signed register error: {e}")
+        print(f"Read signed register 0x{reg_addr:04X} error: {e}")
         return None
 
 def write_register(reg_addr, value):
-    """
-    Writes a 32-bit value to a register in the XM125 module.
-    """
+    """Writes a 32-bit value to a register in the XM125 module."""
     try:
-        # Convert register address and value to bytes
         addr_high = (reg_addr >> 8) & 0xFF
         addr_low = reg_addr & 0xFF
         
         value_bytes = struct.pack('>I', value)
-        
-        # Write data (register address + value)
         data = [addr_low] + list(value_bytes)
         bus.write_i2c_block_data(I2C_ADDR, addr_high, data)
         return True
     except Exception as e:
-        print(f"Write register error: {e}")
+        print(f"Write register 0x{reg_addr:04X} error: {e}")
         return False
 
-def wait_for_int(timeout=10):
-    """
-    Waits for the INT pin to go HIGH indicating the module is ready.
-    """
+def wait_for_int(timeout=5):
+    """Waits for the INT pin to go HIGH indicating the module is ready."""
     start_time = time.time()
     print("Waiting for INT pin to go HIGH...")
     
     while time.time() - start_time < timeout:
         int_state = GPIO.input(INT_PIN)
-        print(f"INT pin state: {int_state} (1=HIGH, 0=LOW)")
         if int_state == GPIO.HIGH:
-            print("INT pin is HIGH - module is ready")
+            print("✓ INT pin is HIGH - module is ready")
             return True
-        time.sleep(POLL_INTERVAL)
+        time.sleep(0.1)
     
-    print("Timeout waiting for INT pin.")
+    print("✗ Timeout waiting for INT pin. Continuing anyway...")
     return False
 
 def initialize_module():
-    """
-    Initializes the XM125 module by waking it up.
-    """
-    print(f"Setting WAKE_UP_PIN (Pin {WAKE_UP_PIN}) to HIGH")
+    """Initializes the XM125 module by waking it up."""
+    print("Initializing module...")
+    
+    # Ensure WAKE_UP is LOW first
+    GPIO.output(WAKE_UP_PIN, GPIO.LOW)
+    time.sleep(0.1)
     
     # Set WAKE UP high
+    print("Setting WAKE_UP_PIN to HIGH...")
     GPIO.output(WAKE_UP_PIN, GPIO.HIGH)
-    print("WAKE UP set to HIGH.")
+    time.sleep(0.5)  # Give more time for module to wake up
+    
+    # Wait for INT pin
+    if wait_for_int():
+        return True
+    else:
+        # Try to continue anyway - sometimes INT might not work
+        print("Trying to continue without INT confirmation...")
+        time.sleep(1)
+        return True
 
-    # Wait for INT pin to go HIGH indicating ready state
-    if not wait_for_int():
-        print("Module did not become ready.")
+def read_module_info():
+    """Read basic module information to verify communication."""
+    print("\nReading module information...")
+    
+    # Read version
+    version = read_unsigned_register(0x0000)
+    if version is not None:
+        print(f"Module Version: 0x{version:08X}")
+    else:
+        print("Failed to read version")
         return False
     
-    print("Module is ready for I2C communication.")
+    # Read protocol status
+    protocol_status = read_unsigned_register(0x0001)
+    if protocol_status is not None:
+        print(f"Protocol Status: 0x{protocol_status:08X}")
+    
+    # Read detector status
+    detector_status = read_unsigned_register(0x0003)
+    if detector_status is not None:
+        print(f"Detector Status: 0x{detector_status:08X}")
+        busy = (detector_status >> 31) & 0x1
+        print(f"  Busy: {busy}")
+    
     return True
 
-def check_i2c_connection():
-    """
-    Check if we can communicate with the XM125 module over I2C.
-    """
+def simple_measurement():
+    """Perform a simple distance measurement."""
+    print("\nPerforming measurement...")
+    
+    # Send MEASURE_DISTANCE command
+    if write_register(0x0100, COMMAND_MEASURE_DISTANCE):
+        print("MEASURE_DISTANCE command sent")
+    else:
+        print("Failed to send MEASURE_DISTANCE command")
+        return None, None
+    
+    # Wait for measurement to complete (check busy bit)
+    timeout = 3
+    start_time = time.time()
+    while time.time() - start_time < timeout:
+        status = read_unsigned_register(0x0003)
+        if status is not None:
+            busy = (status >> 31) & 0x1
+            if not busy:
+                print("Measurement completed")
+                break
+        time.sleep(0.1)
+    else:
+        print("Measurement timeout")
+        return None, None
+    
+    # Read distance result
+    distance_result = read_unsigned_register(0x0010)
+    if distance_result is None:
+        print("Failed to read distance result")
+        return None, None
+    
+    print(f"Distance Result: 0x{distance_result:08X}")
+    
+    # Parse distance result
+    num_distances = distance_result & 0x0000000F
+    measure_distance_error = (distance_result >> 10) & 0x1
+    
+    if measure_distance_error:
+        print("Measurement error detected")
+        return None, None
+    
+    print(f"Number of peaks detected: {num_distances}")
+    
+    # Read peaks
+    distances_m = []
+    strengths_db = []
+    
+    for i in range(min(num_distances, 5)):  # Read up to 5 peaks
+        peak_dist_addr = 0x0011 + i
+        peak_str_addr = 0x001B + i
+
+        distance_raw = read_unsigned_register(peak_dist_addr)
+        strength_raw = read_signed_register(peak_str_addr)
+
+        if distance_raw is not None and strength_raw is not None:
+            distance_m = distance_raw / 1000.0  # Convert mm to m
+            strength_db_val = strength_raw / 1000.0  # Convert to dB
+
+            distances_m.append(distance_m)
+            strengths_db.append(strength_db_val)
+            print(f"Peak{i}: Distance = {distance_m:.3f} m | Strength = {strength_db_val:.3f} dB")
+    
+    return distances_m, strengths_db
+
+def continuous_measurements():
+    """Perform continuous measurements."""
+    print("\nStarting continuous measurements...")
+    print("Press Ctrl+C to stop\n")
+    
     try:
-        # Try to read the version register
-        version = read_unsigned_register(0x0000)
-        if version is not None:
-            print(f"Module Version: 0x{version:08X}")
-            return True
-        else:
-            print("Failed to read module version")
-            return False
-    except Exception as e:
-        print(f"I2C connection check failed: {e}")
-        return False
-
-def test_gpio():
-    """
-    Test GPIO functionality
-    """
-    print("Testing GPIO pins...")
-    
-    # Test WAKE_UP_PIN output
-    print(f"Testing WAKE_UP_PIN (Pin {WAKE_UP_PIN})...")
-    GPIO.output(WAKE_UP_PIN, GPIO.HIGH)
-    time.sleep(1)
-    GPIO.output(WAKE_UP_PIN, GPIO.LOW)
-    time.sleep(1)
-    GPIO.output(WAKE_UP_PIN, GPIO.HIGH)
-    print("WAKE_UP_PIN toggled successfully")
-    
-    # Test INT_PIN input
-    print(f"Testing INT_PIN (Pin {INT_PIN})...")
-    int_state = GPIO.input(INT_PIN)
-    print(f"INT_PIN state: {int_state}")
-    
-    return True
+        while True:
+            distances, strengths = simple_measurement()
+            
+            if distances and strengths:
+                print("--- Measurement Result ---")
+                for idx, (dist, stren) in enumerate(zip(distances, strengths)):
+                    print(f"Peak{idx}: {dist:.3f} m | {stren:.3f} dB")
+                print("--------------------------\n")
+            else:
+                print("No targets detected or measurement failed\n")
+            
+            time.sleep(1)  # Wait 1 second between measurements
+            
+    except KeyboardInterrupt:
+        print("\nMeasurement stopped by user")
 
 def cleanup():
-    """Clean up GPIO"""
-    print("Cleaning up GPIO...")
+    """Clean up GPIO and I2C."""
+    print("Cleaning up...")
     GPIO.output(WAKE_UP_PIN, GPIO.LOW)
     GPIO.cleanup()
     bus.close()
-    print("Cleanup completed")
 
 def main():
-    """
-    Main function to initialize and run radar measurements.
-    """
+    """Main function."""
     try:
-        print("Starting XM125 Radar Module Initialization")
-        print("=" * 50)
-        
-        # First, test GPIO functionality
-        print("1. Testing GPIO pins...")
-        test_gpio()
-        
-        # Scan I2C bus
-        print("\n2. Scanning I2C devices...")
-        devices_found = []
-        for address in range(0x08, 0x78):
-            try:
-                bus.read_byte(address)
-                devices_found.append(address)
-                print(f"   Device found at: 0x{address:02X}")
-            except:
-                pass
-        
-        if not devices_found:
-            print("   No I2C devices found! Check connections.")
-            return
-        
-        if I2C_ADDR not in devices_found:
-            print(f"   XM125 module not found at 0x{I2C_ADDR:02X}")
-            print(f"   Available devices: {[hex(addr) for addr in devices_found]}")
-            return
-        
-        print(f"   ✓ XM125 module found at 0x{I2C_ADDR:02X}")
+        print("XM125 Radar Module - Data Acquisition")
+        print("=" * 40)
         
         # Initialize module
-        print("\n3. Initializing module...")
         if not initialize_module():
-            print("   ✗ Failed to initialize module")
+            print("Failed to initialize module")
             return
         
-        # Check I2C communication
-        print("\n4. Checking I2C communication...")
-        if not check_i2c_connection():
-            print("   ✗ Failed to communicate with module over I2C")
+        # Read module info
+        if not read_module_info():
+            print("Failed to read module information")
             return
         
-        print("\n5. ✓ Module initialized successfully!")
-        print("   Ready for measurements...")
+        # Start continuous measurements
+        continuous_measurements()
         
-        # Simple measurement loop
-        print("\n6. Starting measurement loop...")
-        counter = 0
-        while counter < 10:  # Run for 10 measurements
-            print(f"\nMeasurement {counter + 1}:")
-            
-            # Add your actual measurement logic here
-            # For now, just simulate
-            print("   Taking measurement...")
-            
-            # Check INT pin state
-            int_state = GPIO.input(INT_PIN)
-            print(f"   INT pin state: {int_state}")
-            
-            counter += 1
-            time.sleep(MEASUREMENT_INTERVAL)
-            
-    except KeyboardInterrupt:
-        print("\nMeasurement stopped by user.")
     except Exception as e:
-        print(f"\nUnexpected error: {e}")
+        print(f"Unexpected error: {e}")
         import traceback
         traceback.print_exc()
     finally:
